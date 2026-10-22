@@ -533,6 +533,11 @@ with st.sidebar.expander("Cấu hình gửi email"):
     st.text_input("Email gửi đi", key="smtp_user")
     st.text_input("Mật khẩu ứng dụng", type="password", key="smtp_password")
     st.text_input("Tên người gửi", value=TEN_DAY_TRO, key="smtp_ten")
+    st.checkbox(
+        "Tự động gửi phiếu PDF qua email mỗi khi bấm 'Lưu thông tin phòng'",
+        value=False,
+        key="tu_dong_gui",
+    )
 
 # Đảm bảo dữ liệu các phòng của tháng đang chọn đã tồn tại trong database
 ensure_records(nam_chon, idx_thang_chon, so_phong)
@@ -603,6 +608,22 @@ if submitted:
     )
     st.success(f"Đã lưu Phòng {phong} - {thang_chon}")
     rec = get_record(nam_chon, idx_thang_chon, phong)
+
+    if st.session_state.get("tu_dong_gui"):
+        cfg_auto = lay_cau_hinh_smtp()
+        if not cfg_auto:
+            st.warning("Đang bật tự động gửi email nhưng chưa cấu hình tài khoản gửi mail.")
+        elif not email_hop_le(rec["email"]):
+            st.warning("Phòng này chưa có email hợp lệ nên chưa gửi phiếu.")
+        else:
+            try:
+                pdf_auto = tao_pdf(
+                    nam_chon, idx_thang_chon, [(rec, tinh_tien(rec, prices), prices)]
+                )
+                gui_phieu(cfg_auto, rec, pdf_auto, nam_chon, idx_thang_chon)
+                st.success(f"Đã tự động gửi phiếu tới {rec['email']}")
+            except Exception as ex:
+                st.error(f"Gửi email tự động thất bại: {ex}")
 
 # Xuất PDF riêng cho phòng đang chọn
 try:
