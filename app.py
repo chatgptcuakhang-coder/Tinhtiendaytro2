@@ -386,11 +386,22 @@ def email_hop_le(addr):
     return bool(addr) and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", addr.strip()) is not None
 
 
+THONG_BAO_CHUA_CAU_HINH = (
+    "Chưa cấu hình tài khoản gửi email. Cách 1: mở sidebar > 'Cấu hình gửi email', "
+    "điền Email gửi đi và Mật khẩu ứng dụng (16 ký tự của Google). "
+    "Cách 2: khai báo mục [smtp] trong Secrets (xem hướng dẫn trong file secrets.toml)."
+)
+
+
+def la_mat_khau_mau(pw):
+    return (not pw) or str(pw).startswith("DAN_MAT_KHAU")
+
+
 def lay_cau_hinh_smtp():
     """Ưu tiên st.secrets["smtp"]; nếu không có thì dùng thông tin nhập ở sidebar."""
     try:
         sec = st.secrets["smtp"]
-        if sec.get("user") and sec.get("password"):
+        if sec.get("user") and not la_mat_khau_mau(sec.get("password")):
             return {
                 "host": sec.get("host", "smtp.gmail.com"),
                 "port": int(sec.get("port", 587)),
@@ -433,16 +444,62 @@ def gui_phieu(cfg, rec, pdf_bytes, nam, thang):
         filename=f"Phieu_Phong_{rec['phong']}_{thang:02d}_{nam}.pdf",
     )
 
-    context = ssl.create_default_context()
-    if cfg["port"] == 465:
-        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=30) as s:
-            s.login(cfg["user"], cfg["password"])
-            s.send_message(msg)
-    else:
-        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as s:
-            s.starttls(context=context)
-            s.login(cfg["user"], cfg["password"])
-            s.send_message(msg)
+    def _gui(port):
+        context = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(cfg["host"], port, context=context, timeout=30) as srv:
+                srv.login(cfg["user"], cfg["password"])
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["host"], port, timeout=30) as srv:
+                srv.ehlo()
+                srv.starttls(context=context)
+                srv.ehlo()
+                srv.login(cfg["user"], cfg["password"])
+                srv.send_message(msg)
+
+    try:
+        _gui(cfg["port"])
+    except (smtplib.SMTPServerDisconnected, ConnectionError, TimeoutError):
+        # Cổng 587 bị đóng kết nối thì thử lại bằng cổng 465 (SSL)
+        if cfg["port"] == 465:
+            raise
+        _gui(465)
+
+
+def dich_loi_smtp(ex):
+    if isinstance(ex, smtplib.SMTPAuthenticationError):
+        return (
+            "Gmail từ chối đăng nhập. Hãy dùng Mật khẩu ứng dụng 16 ký tự (không phải mật khẩu "
+            "đăng nhập Gmail) và đảm bảo Email gửi đi là tài khoản đã tạo mật khẩu ứng dụng đó."
+        )
+    if isinstance(ex, smtplib.SMTPServerDisconnected):
+        return (
+            "Máy chủ Gmail đóng kết nối (thường do sai mật khẩu/tài khoản hoặc bị chặn). "
+            f"Chi tiết: {ex}"
+        )
+    return str(ex)
+
+
+def kiem_tra_smtp(cfg):
+    """Thử kết nối + đăng nhập (không gửi thư) và báo rõ lỗi ở bước nào."""
+    buoc = "kết nối tới máy chủ"
+    try:
+        context = ssl.create_default_context()
+        if cfg["port"] == 465:
+            srv = smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=20)
+        else:
+            srv = smtplib.SMTP(cfg["host"], cfg["port"], timeout=20)
+            buoc = "bật mã hóa TLS"
+            srv.ehlo()
+            srv.starttls(context=context)
+            srv.ehlo()
+        buoc = "đăng nhập"
+        srv.login(cfg["user"], cfg["password"])
+        srv.quit()
+        return True, "Kết nối và đăng nhập thành công. Có thể gửi email."
+    except Exception as ex:
+        return False, f"Lỗi ở bước '{buoc}' ({type(ex).__name__}): {dich_loi_smtp(ex)}"
 
 
 # ======================================
@@ -523,7 +580,13 @@ if prices["gia_dien"] < 100 or prices["gia_nuoc"] < 100:
         "thay vì 3 (đơn vị là đồng)."
     )
 
-with st.sidebar.expander("Cấu hình gửi email"):
+_cfg_hien_tai = lay_cau_hinh_smtp()
+if _cfg_hien_tai:
+    st.sidebar.caption(f"Email gửi phiếu: {_cfg_hien_tai['user']}")
+else:
+    st.sidebar.warning("Chưa cấu hình email gửi phiếu")
+
+with st.sidebar.expander("Cấu hình gửi email", expanded=_cfg_hien_tai is None):
     st.caption(
         "Với Gmail, hãy dùng Mật khẩu ứng dụng (App password), không dùng mật khẩu đăng nhập. "
         "Thông tin này chỉ giữ tạm trong phiên làm việc, không lưu vào database."
@@ -538,6 +601,14 @@ with st.sidebar.expander("Cấu hình gửi email"):
         value=False,
         key="tu_dong_gui",
     )
+    if st.button("Kiểm tra kết nối email", key="btn_test_smtp"):
+        cfg_test = lay_cau_hinh_smtp()
+        if not cfg_test:
+            st.error("Hãy điền Email gửi đi và Mật khẩu ứng dụng trước.")
+        else:
+            with st.spinner("Đang kiểm tra..."):
+                ok, thong_bao = kiem_tra_smtp(cfg_test)
+            (st.success if ok else st.error)(thong_bao)
 
 # Đảm bảo dữ liệu các phòng của tháng đang chọn đã tồn tại trong database
 ensure_records(nam_chon, idx_thang_chon, so_phong)
@@ -623,7 +694,7 @@ if submitted:
                 gui_phieu(cfg_auto, rec, pdf_auto, nam_chon, idx_thang_chon)
                 st.success(f"Đã tự động gửi phiếu tới {rec['email']}")
             except Exception as ex:
-                st.error(f"Gửi email tự động thất bại: {ex}")
+                st.error(f"Gửi email tự động thất bại: {dich_loi_smtp(ex)}")
 
 # Xuất PDF riêng cho phòng đang chọn
 try:
@@ -640,7 +711,7 @@ try:
     if st.button(f"Gửi PDF Phòng {phong} qua email", key=f"send_{suffix}_{phong}"):
         cfg = lay_cau_hinh_smtp()
         if not cfg:
-            st.error("Chưa cấu hình gửi email. Hãy mở mục 'Cấu hình gửi email' ở sidebar.")
+            st.error(THONG_BAO_CHUA_CAU_HINH)
         elif not email_hop_le(rec["email"]):
             st.error("Phòng này chưa có email hợp lệ. Hãy nhập email và bấm 'Lưu thông tin phòng'.")
         else:
@@ -649,7 +720,7 @@ try:
                     gui_phieu(cfg, rec, pdf_phong, nam_chon, idx_thang_chon)
                 st.success(f"Đã gửi phiếu Phòng {phong} tới {rec['email']}")
             except Exception as ex:
-                st.error(f"Gửi email thất bại: {ex}")
+                st.error(f"Gửi email thất bại: {dich_loi_smtp(ex)}")
 except FileNotFoundError as e:
     st.warning(str(e))
 
@@ -750,7 +821,7 @@ if ket_qua:
     if st.button("Gửi PDF cho tất cả phòng có email", disabled=not co_email):
         cfg = lay_cau_hinh_smtp()
         if not cfg:
-            st.error("Chưa cấu hình gửi email. Hãy mở mục 'Cấu hình gửi email' ở sidebar.")
+            st.error(THONG_BAO_CHUA_CAU_HINH)
         else:
             thanh_cong, loi = 0, []
             tien_do = st.progress(0.0)
@@ -761,7 +832,7 @@ if ket_qua:
                     gui_phieu(cfg, r_i, pdf_i, nam_chon, idx_thang_chon)
                     thanh_cong += 1
                 except Exception as ex:
-                    loi.append(f"Phòng {r_i['phong']}: {ex}")
+                    loi.append(f"Phòng {r_i['phong']}: {dich_loi_smtp(ex)}")
                 tien_do.progress(n / len(co_email))
             st.success(f"Đã gửi thành công {thanh_cong}/{len(co_email)} phòng")
             for dong_loi in loi:
