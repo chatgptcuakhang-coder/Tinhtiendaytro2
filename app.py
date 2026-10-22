@@ -1,7 +1,12 @@
 import os
+import re
+import smtplib
 import sqlite3
+import ssl
 from contextlib import closing
 from datetime import datetime
+from email.message import EmailMessage
+from email.utils import formataddr
 
 import pandas as pd
 import streamlit as st
@@ -61,6 +66,7 @@ def init_db():
                 gia_phong  INTEGER NOT NULL DEFAULT 0,
                 nguoi_o    TEXT    NOT NULL DEFAULT '',
                 sdt        TEXT    NOT NULL DEFAULT '',
+                email      TEXT    NOT NULL DEFAULT '',
                 so_nguoi   INTEGER NOT NULL DEFAULT 1,
                 dien_cu    INTEGER NOT NULL DEFAULT 0,
                 dien_moi   INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +77,10 @@ def init_db():
             );
             """
         )
+        # Nâng cấp database cũ: thêm cột email nếu chưa có
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(records)").fetchall()]
+        if "email" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN email TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
 
@@ -116,12 +126,21 @@ def get_month_prices(nam, thang):
     return prices
 
 
-def save_month_prices(nam, thang, gia_dien, gia_nuoc, phi_khac):
+def save_month_prices(nam, thang, gia_dien, gia_nuoc, phi_khac, ap_dung_thang_sau=False):
     with closing(get_conn()) as conn:
-        conn.execute(
-            "UPDATE month_prices SET gia_dien = ?, gia_nuoc = ?, phi_khac = ? WHERE nam = ? AND thang = ?",
-            (gia_dien, gia_nuoc, phi_khac, nam, thang),
-        )
+        if ap_dung_thang_sau:
+            # Áp dụng cho tháng này và tất cả các tháng sau đã có đơn giá
+            conn.execute(
+                "UPDATE month_prices SET gia_dien = ?, gia_nuoc = ?, phi_khac = ? "
+                "WHERE (nam * 100 + thang) >= ?",
+                (gia_dien, gia_nuoc, phi_khac, nam * 100 + thang),
+            )
+        else:
+            conn.execute(
+                "UPDATE month_prices SET gia_dien = ?, gia_nuoc = ?, phi_khac = ? "
+                "WHERE nam = ? AND thang = ?",
+                (gia_dien, gia_nuoc, phi_khac, nam, thang),
+            )
         conn.commit()
 
 
@@ -145,16 +164,16 @@ def ensure_records(nam, thang, so_phong):
             if prev:
                 values = (
                     nam, thang, phong, prev["gia_phong"], prev["nguoi_o"], prev["sdt"],
-                    prev["so_nguoi"], prev["dien_moi"], prev["dien_moi"],
+                    prev["email"], prev["so_nguoi"], prev["dien_moi"], prev["dien_moi"],
                     prev["nuoc_moi"], prev["nuoc_moi"], TRANG_THAI[0],
                 )
             else:
                 values = (
-                    nam, thang, phong, GIA_PHONG_MAC_DINH, "", "", 1, 0, 0, 0, 0, TRANG_THAI[0],
+                    nam, thang, phong, GIA_PHONG_MAC_DINH, "", "", "", 1, 0, 0, 0, 0, TRANG_THAI[0],
                 )
             conn.execute(
-                "INSERT INTO records (nam, thang, phong, gia_phong, nguoi_o, sdt, so_nguoi, "
-                "dien_cu, dien_moi, nuoc_cu, nuoc_moi, trang_thai) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO records (nam, thang, phong, gia_phong, nguoi_o, sdt, email, so_nguoi, "
+                "dien_cu, dien_moi, nuoc_cu, nuoc_moi, trang_thai) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
         conn.commit()
@@ -181,11 +200,11 @@ def get_records(nam, thang, so_phong):
 def save_record(nam, thang, phong, d):
     with closing(get_conn()) as conn:
         conn.execute(
-            "UPDATE records SET gia_phong = ?, nguoi_o = ?, sdt = ?, so_nguoi = ?, "
+            "UPDATE records SET gia_phong = ?, nguoi_o = ?, sdt = ?, email = ?, so_nguoi = ?, "
             "dien_cu = ?, dien_moi = ?, nuoc_cu = ?, nuoc_moi = ?, trang_thai = ? "
             "WHERE nam = ? AND thang = ? AND phong = ?",
             (
-                d["gia_phong"], d["nguoi_o"], d["sdt"], d["so_nguoi"],
+                d["gia_phong"], d["nguoi_o"], d["sdt"], d["email"], d["so_nguoi"],
                 d["dien_cu"], d["dien_moi"], d["nuoc_cu"], d["nuoc_moi"], d["trang_thai"],
                 nam, thang, phong,
             ),
@@ -361,6 +380,72 @@ def tao_pdf(nam, thang, danh_sach):
 
 
 # ======================================
+# GỬI EMAIL
+# ======================================
+def email_hop_le(addr):
+    return bool(addr) and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", addr.strip()) is not None
+
+
+def lay_cau_hinh_smtp():
+    """Ưu tiên st.secrets["smtp"]; nếu không có thì dùng thông tin nhập ở sidebar."""
+    try:
+        sec = st.secrets["smtp"]
+        if sec.get("user") and sec.get("password"):
+            return {
+                "host": sec.get("host", "smtp.gmail.com"),
+                "port": int(sec.get("port", 587)),
+                "user": sec["user"],
+                "password": sec["password"],
+                "ten": sec.get("sender_name", TEN_DAY_TRO),
+            }
+    except Exception:
+        pass
+
+    user = st.session_state.get("smtp_user", "").strip()
+    password = st.session_state.get("smtp_password", "")
+    if user and password:
+        return {
+            "host": st.session_state.get("smtp_host", "smtp.gmail.com").strip(),
+            "port": int(st.session_state.get("smtp_port", 587)),
+            "user": user,
+            "password": password,
+            "ten": st.session_state.get("smtp_ten", TEN_DAY_TRO),
+        }
+    return None
+
+
+def gui_phieu(cfg, rec, pdf_bytes, nam, thang):
+    msg = EmailMessage()
+    msg["Subject"] = f"Phiếu thu tiền phòng {rec['phong']} - Tháng {thang}/{nam}"
+    msg["From"] = formataddr((cfg["ten"], cfg["user"]))
+    msg["To"] = rec["email"].strip()
+    ten = rec["nguoi_o"] or "anh/chị"
+    msg.set_content(
+        f"Xin chào {ten},\n\n"
+        f"{TEN_DAY_TRO} gửi anh/chị phiếu thu tiền phòng {rec['phong']} "
+        f"tháng {thang}/{nam} (file PDF đính kèm).\n"
+        f"Nếu có thắc mắc, anh/chị vui lòng liên hệ chủ trọ.\n\nTrân trọng."
+    )
+    msg.add_attachment(
+        pdf_bytes,
+        maintype="application",
+        subtype="pdf",
+        filename=f"Phieu_Phong_{rec['phong']}_{thang:02d}_{nam}.pdf",
+    )
+
+    context = ssl.create_default_context()
+    if cfg["port"] == 465:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=context, timeout=30) as s:
+            s.login(cfg["user"], cfg["password"])
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as s:
+            s.starttls(context=context)
+            s.login(cfg["user"], cfg["password"])
+            s.send_message(msg)
+
+
+# ======================================
 # GIAO DIỆN
 # ======================================
 init_db()
@@ -402,21 +487,52 @@ st.sidebar.caption(f"Đơn giá áp dụng riêng cho {thang_chon}")
 prices_db = get_month_prices(nam_chon, idx_thang_chon)
 suffix = f"{nam_chon}_{idx_thang_chon}"
 
-gia_dien = st.sidebar.number_input(
-    "Giá điện (đ/kWh)", min_value=0, value=int(prices_db["gia_dien"]), step=100,
-    key=f"gia_dien_{suffix}",
+with st.sidebar.form(key=f"form_gia_{suffix}"):
+    f_gia_dien = st.number_input(
+        "Giá điện (đ/kWh)", min_value=0, value=int(prices_db["gia_dien"]), step=100,
+    )
+    f_gia_nuoc = st.number_input(
+        "Giá nước (đ/m³)", min_value=0, value=int(prices_db["gia_nuoc"]), step=500,
+    )
+    f_phi_khac = st.number_input(
+        "Phí khác (wifi, vệ sinh...)", min_value=0, value=int(prices_db["phi_khac"]), step=10000,
+    )
+    ap_dung_sau = st.checkbox("Áp dụng cho cả các tháng sau", value=False)
+    luu_gia = st.form_submit_button("Lưu đơn giá", type="primary", use_container_width=True)
+
+if luu_gia:
+    save_month_prices(
+        nam_chon, idx_thang_chon, f_gia_dien, f_gia_nuoc, f_phi_khac, ap_dung_sau
+    )
+    prices_db = get_month_prices(nam_chon, idx_thang_chon)
+    st.sidebar.success("Đã lưu đơn giá")
+
+# Đơn giá dùng để tính tiền luôn là đơn giá đã lưu trong database
+prices = {
+    "gia_dien": int(prices_db["gia_dien"]),
+    "gia_nuoc": int(prices_db["gia_nuoc"]),
+    "phi_khac": int(prices_db["phi_khac"]),
+}
+st.sidebar.caption(
+    f"Đang áp dụng: điện {tien(prices['gia_dien'])} đ/kWh, "
+    f"nước {tien(prices['gia_nuoc'])} đ/m³, phí khác {tien(prices['phi_khac'])} đ"
 )
-gia_nuoc = st.sidebar.number_input(
-    "Giá nước (đ/m³)", min_value=0, value=int(prices_db["gia_nuoc"]), step=500,
-    key=f"gia_nuoc_{suffix}",
-)
-phi_khac = st.sidebar.number_input(
-    "Phí khác (wifi, vệ sinh...)", min_value=0, value=int(prices_db["phi_khac"]), step=10000,
-    key=f"phi_khac_{suffix}",
-)
-prices = {"gia_dien": gia_dien, "gia_nuoc": gia_nuoc, "phi_khac": phi_khac}
-if prices != prices_db:
-    save_month_prices(nam_chon, idx_thang_chon, gia_dien, gia_nuoc, phi_khac)
+if prices["gia_dien"] < 100 or prices["gia_nuoc"] < 100:
+    st.sidebar.warning(
+        "Đơn giá điện hoặc nước đang rất thấp. Hãy nhập đầy đủ, ví dụ 3500 "
+        "thay vì 3 (đơn vị là đồng)."
+    )
+
+with st.sidebar.expander("Cấu hình gửi email"):
+    st.caption(
+        "Với Gmail, hãy dùng Mật khẩu ứng dụng (App password), không dùng mật khẩu đăng nhập. "
+        "Thông tin này chỉ giữ tạm trong phiên làm việc, không lưu vào database."
+    )
+    st.text_input("Máy chủ SMTP", value="smtp.gmail.com", key="smtp_host")
+    st.number_input("Cổng", min_value=1, max_value=65535, value=587, key="smtp_port")
+    st.text_input("Email gửi đi", key="smtp_user")
+    st.text_input("Mật khẩu ứng dụng", type="password", key="smtp_password")
+    st.text_input("Tên người gửi", value=TEN_DAY_TRO, key="smtp_ten")
 
 # Đảm bảo dữ liệu các phòng của tháng đang chọn đã tồn tại trong database
 ensure_records(nam_chon, idx_thang_chon, so_phong)
@@ -449,6 +565,11 @@ with st.form(key=f"form_{suffix}_{phong}"):
             "Số người ở", min_value=0, max_value=20, value=int(rec["so_nguoi"]), step=1
         )
 
+    email = st.text_input(
+        "Email nhận phiếu thu (để gửi PDF)", value=rec["email"],
+        placeholder="vidu@gmail.com",
+    )
+
     # Hàng 2: điện nước
     b1, b2, b3, b4 = st.columns(4)
     with b1:
@@ -475,6 +596,7 @@ if submitted:
         nam_chon, idx_thang_chon, phong,
         {
             "gia_phong": gia_phong, "nguoi_o": nguoi_o.strip(), "sdt": sdt.strip(),
+            "email": email.strip(),
             "so_nguoi": so_nguoi, "dien_cu": dien_cu, "dien_moi": dien_moi,
             "nuoc_cu": nuoc_cu, "nuoc_moi": nuoc_moi, "trang_thai": trang_thai,
         },
@@ -494,6 +616,19 @@ try:
         mime="application/pdf",
         key=f"pdf_phong_{suffix}_{phong}",
     )
+    if st.button(f"Gửi PDF Phòng {phong} qua email", key=f"send_{suffix}_{phong}"):
+        cfg = lay_cau_hinh_smtp()
+        if not cfg:
+            st.error("Chưa cấu hình gửi email. Hãy mở mục 'Cấu hình gửi email' ở sidebar.")
+        elif not email_hop_le(rec["email"]):
+            st.error("Phòng này chưa có email hợp lệ. Hãy nhập email và bấm 'Lưu thông tin phòng'.")
+        else:
+            try:
+                with st.spinner("Đang gửi email..."):
+                    gui_phieu(cfg, rec, pdf_phong, nam_chon, idx_thang_chon)
+                st.success(f"Đã gửi phiếu Phòng {phong} tới {rec['email']}")
+            except Exception as ex:
+                st.error(f"Gửi email thất bại: {ex}")
 except FileNotFoundError as e:
     st.warning(str(e))
 
@@ -517,6 +652,7 @@ for r in records:
         "Phòng": f"Phòng {r['phong']}",
         "Người ở": r["nguoi_o"],
         "SĐT": r["sdt"],
+        "Email": r["email"],
         "Giá phòng": r["gia_phong"],
         "Số điện cũ": r["dien_cu"],
         "Số điện mới": r["dien_moi"],
@@ -586,5 +722,28 @@ if ket_qua:
                     mime="application/octet-stream",
                     use_container_width=True,
                 )
+
+    st.subheader("Gửi phiếu qua email")
+    co_email = [x for x in danh_sach_pdf if email_hop_le(x[0]["email"])]
+    st.caption(f"{len(co_email)}/{len(danh_sach_pdf)} phòng có email hợp lệ")
+    if st.button("Gửi PDF cho tất cả phòng có email", disabled=not co_email):
+        cfg = lay_cau_hinh_smtp()
+        if not cfg:
+            st.error("Chưa cấu hình gửi email. Hãy mở mục 'Cấu hình gửi email' ở sidebar.")
+        else:
+            thanh_cong, loi = 0, []
+            tien_do = st.progress(0.0)
+            for n, item in enumerate(co_email, start=1):
+                r_i = item[0]
+                try:
+                    pdf_i = tao_pdf(nam_chon, idx_thang_chon, [item])
+                    gui_phieu(cfg, r_i, pdf_i, nam_chon, idx_thang_chon)
+                    thanh_cong += 1
+                except Exception as ex:
+                    loi.append(f"Phòng {r_i['phong']}: {ex}")
+                tien_do.progress(n / len(co_email))
+            st.success(f"Đã gửi thành công {thanh_cong}/{len(co_email)} phòng")
+            for dong_loi in loi:
+                st.error(dong_loi)
 else:
     st.info("Chưa có dữ liệu phòng nào cho tháng này.")
