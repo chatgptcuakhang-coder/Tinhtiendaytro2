@@ -28,6 +28,7 @@ CAI_DAT_MAC_DINH = {
 
 st.set_page_config(
     page_title="Quản lý tiền phòng trọ",
+    page_icon="🏠",
     layout="wide",
 )
 
@@ -406,6 +407,7 @@ def lay_cau_hinh_smtp():
                 "host": sec.get("host", "smtp.gmail.com"),
                 "port": int(sec.get("port", 587)),
                 "user": sec["user"],
+                "from": sec.get("from_email", sec["user"]),
                 "password": sec["password"],
                 "ten": sec.get("sender_name", TEN_DAY_TRO),
             }
@@ -419,6 +421,7 @@ def lay_cau_hinh_smtp():
             "host": st.session_state.get("smtp_host", "smtp.gmail.com").strip(),
             "port": int(st.session_state.get("smtp_port", 587)),
             "user": user,
+            "from": st.session_state.get("smtp_from", "").strip() or user,
             "password": password,
             "ten": st.session_state.get("smtp_ten", TEN_DAY_TRO),
         }
@@ -428,7 +431,7 @@ def lay_cau_hinh_smtp():
 def gui_phieu(cfg, rec, pdf_bytes, nam, thang):
     msg = EmailMessage()
     msg["Subject"] = f"Phiếu thu tiền phòng {rec['phong']} - Tháng {thang}/{nam}"
-    msg["From"] = formataddr((cfg["ten"], cfg["user"]))
+    msg["From"] = formataddr((cfg["ten"], cfg.get("from") or cfg["user"]))
     msg["To"] = rec["email"].strip()
     ten = rec["nguoi_o"] or "anh/chị"
     msg.set_content(
@@ -593,7 +596,10 @@ with st.sidebar.expander("Cấu hình gửi email", expanded=_cfg_hien_tai is No
     )
     st.text_input("Máy chủ SMTP", value="smtp.gmail.com", key="smtp_host")
     st.number_input("Cổng", min_value=1, max_value=65535, value=587, key="smtp_port")
-    st.text_input("Email gửi đi", key="smtp_user")
+    st.text_input("Email gửi đi (tài khoản đăng nhập SMTP)", key="smtp_user")
+    st.text_input(
+        "Email hiển thị người gửi (để trống nếu giống ô trên)", key="smtp_from"
+    )
     st.text_input("Mật khẩu ứng dụng", type="password", key="smtp_password")
     st.text_input("Tên người gửi", value=TEN_DAY_TRO, key="smtp_ten")
     st.checkbox(
